@@ -1,0 +1,118 @@
+- hosts: rke2_load_balancer
+  become: yes
+  tasks:
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx for RKE2 Load Balancing
+      blockinfile:
+        path: /etc/nginx/nginx.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+        block: |
+          stream {
+            upstream rke2_servers {
+              server 10.0.3.41:9345;
+              server 10.0.3.42:9345;
+              server 10.0.3.43:9345;
+            }
+
+            server {
+              listen 9345;
+              proxy_pass rke2_servers;
+            }
+          }
+      notify: restart nginx
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+- hosts: rke2_servers
+  become: yes
+  vars:
+    lb_host: "{{ hostvars[groups['rke2_load_balancer'][0]]['ansible_host'] }}"
+  tasks:
+    - name: Create RKE2 server configuration
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        content: |
+          server: https://{{ lb_host }}:9345
+          token: "{{ lookup('file', '/var/lib/rancher/rke2/server/node-token') if inventory_hostname == groups['rke2_servers'][0] else '' }}"
+      when: inventory_hostname == groups['rke2_servers'][0]
+
+    - name: Install RKE2 Server
+      shell: |
+        curl -sfL https://get.rke2.io | sh -
+        systemctl enable rke2-server.service
+        systemctl start rke2-server.service
+
+    - name: Wait for server to initialize
+      wait_for:
+        path: /var/lib/rancher/rke2/server/node-token
+        timeout: 120
+      when: inventory_hostname == groups['rke2_servers'][0]
+
+    - name: Link kubectl for first server
+      shell: ln -s $(find /var/lib/rancher/rke2/data/ -name kubectl) /usr/local/bin/kubectl
+      when: inventory_hostname == groups['rke2_servers'][0]
+
+    - name: Set KUBECONFIG for first server
+      shell: export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+      when: inventory_hostname == groups['rke2_servers'][0]
+
+    - name: Wait for all servers to be ready
+      uri:
+        url: "https://{{ ansible_host }}:6443/readyz"
+        method: GET
+        validate_certs: no
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Create RKE2 server configuration for additional servers
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        content: |
+          server: https://{{ lb_host }}:9345
+          token: "{{ lookup('file', '/var/lib/rancher/rke2/server/node-token') }}"
+          tls-san:
+            - "{{ lb_host }}"
+      when: inventory_hostname != groups['rke2_servers'][0]
+
+- hosts: rke2_workers
+  become: yes
+  vars:
+    lb_host: "{{ hostvars[groups['rke2_load_balancer'][0]]['ansible_host'] }}"
+  tasks:
+    - name: Wait for all servers to be ready
+      uri:
+        url: "https://{{ hostvars[item]['ansible_host'] }}:6443/readyz"
+        method: GET
+        validate_certs: no
+        status_code: 200
+      loop: "{{ groups['rke2_servers'] }}"
+      loop_control:
+        loop_var: item
+      register: server_health_checks
+      until: all(item.status == 200 for item in server_health_checks.results)
+      retries: 30
+      delay: 20
+
+    - name: Create RKE2 agent configuration
+      copy:
+        dest: /etc/rancher/rke2/config.yaml
+        content: |
+          server: https://{{ lb_host }}:9345
+          token: "{{ lookup('file', '/var/lib/rancher/rke2/server/node-token') }}"
+
+    - name: Install RKE2 Agent
+      shell: |
+        curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="agent" sh -
+        systemctl enable rke2-agent.service
+        systemctl start rke2-agent.service
