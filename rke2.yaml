@@ -110,6 +110,8 @@
         content: |
           server: https://{{ lb_host }}:9345
           token: "{{ lookup('file', '/var/lib/rancher/rke2/server/node-token') }}"
+          tls-san:
+            - "{{ lb_host }}"
 
     - name: Install RKE2 Agent
       shell: |
