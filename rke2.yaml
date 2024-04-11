@@ -13,9 +13,9 @@
         block: |
           stream {
             upstream rke2_servers {
-              server 10.0.3.41:9345;
-              server 10.0.3.42:9345;
-              server 10.0.3.43:9345;
+              {% for host in groups['rke2_servers'] %}
+              server {{ hostvars[host]['ansible_host'] }}:9345;
+              {% endfor %}
             }
 
             server {
